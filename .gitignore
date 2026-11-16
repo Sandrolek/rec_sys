@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+data/
+*.part
+# веса большие; в репозитории лежат только маленькие модели для MovieLens-100k
+weights/*
+!weights/twotower_ml100k.pt
+!weights/twotower_ml100k_logq.pt
