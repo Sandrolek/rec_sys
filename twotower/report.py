@@ -21,13 +21,15 @@ CLAIM_USERS, CLAIM_LOSS = 847, 5.6
 DEFAULT_PROTOCOL = ("model", "test/seen=train+val", "recall", "all")
 # как получен вектор пользователя; перебирается при поиске протокола авторов
 SCORER_NOTE = {
-    "model": "башня пользователя",
+    "model": "башня пользователя, исполнитель у всех треков",
     "model_artists_train": "башня пользователя, исполнитель только у треков из train",
     "model_seed_tracks": "среднее векторов треков пользователя, как в демо авторов",
     "model_seed_events": "среднее векторов треков с весом по числу прослушиваний",
 }
 SUBSET_NOTE = {"all": "все", "warm": "с историей в train"}
 HEADER = ["", "@10", "@50", "@100", "польз."]
+# обычный recall: доля новых объектов пользователя в топе, из выдачи убрано всё виденное до теста
+RECALL = ("recall", "test/seen=train+val", "all")
 
 
 def metric(run: dict, scorer: str, config: str, name: str, subset: str = "all") -> list[float] | None:
@@ -58,6 +60,10 @@ def cells(vals: list[float] | None) -> list[str]:
 def row(label: str, run: dict, scorer: str, config: str, name: str, subset: str = "all") -> list[str]:
     users = n_users(run, scorer, config, subset) if scorer.startswith("model") else ""
     return [label, *cells(metric(run, scorer, config, name, subset)), str(users)]
+
+
+def num(v: float) -> str:
+    return f"{v:.4f}" if v >= 1e-3 else f"{v:.1e}"
 
 
 def lift(vals: list[float] | None, base: list[float] | None) -> str:
@@ -130,6 +136,35 @@ def lastfm_section(
     return lines, summary
 
 
+def plain_metrics_section(
+    author: dict | None, retrained: dict | None, scorer: str, config: str, name: str, subset: str
+) -> list[str]:
+    """Те же модели в метрике авторов и в обычном recall, с исполнителем из train и у всех треков."""
+    base = author or retrained
+    columns = [(name, config, subset), RECALL]
+
+    def values(run: dict, sc: str) -> list[str]:
+        out = []
+        for col_name, col_config, col_subset in columns:
+            vals = metric(run, sc, col_config, col_name, col_subset)
+            out += [num(vals[0]), num(vals[-1])] if vals else ["—", "—"]
+        return out
+
+    rows = []
+    for label, run in (("Веса авторов", author), ("Обучение с нуля", retrained)):
+        for sc in dict.fromkeys((scorer, "model")) if run else ():
+            rows.append([f"{label}: {SCORER_NOTE[sc]}", *values(run, sc)])
+    rows.append(["Бейзлайн: популярное", *values(base, "popularity")])
+    rows.append(["Бейзлайн: случайная выдача", *values(base, "random")])
+    header = ["", f"{name}@10", f"{name}@100", "recall@10", "recall@100"]
+    return [
+        *table(header, rows),
+        f"`{name}` — в протоколе авторов (`{config}`, пользователи — {SUBSET_NOTE[subset]}); "
+        f"`recall` — доля новых треков пользователя, попавших в топ (`{RECALL[1]}`, все пользователи).",
+        "",
+    ]
+
+
 def movielens_section(runs: dict, split: str, title: str, config: str, name: str) -> tuple[list[str], list[list[str]]]:
     asis = runs.get(f"ml100k_{split}_asis")
     tuned = runs.get(best_run(runs, f"ml100k_{split}_bs") or "")
@@ -174,6 +209,9 @@ def build(runs: dict) -> list[str]:
         body, rows = lastfm_section(author, retrained, scorer, config, name, subset)
         sections.append(("Воспроизведение на Last.fm 1K", body))
         summary += rows
+        if (scorer, name) != ("model", RECALL[0]):
+            body = plain_metrics_section(author, retrained, scorer, config, name, subset)
+            sections.append(("Last.fm 1K в обычных метриках", body))
     movielens = []
     splits = (("global", "общая временная шкала, как у авторов"), ("user", "по времени внутри каждого пользователя"))
     for split, title in splits:
