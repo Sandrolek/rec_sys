@@ -2,8 +2,9 @@
 
 Авторы пишут только «Recall@K на 847 отложенных пользователях с фильтрацией прослушанных треков»,
 а код оценки недоступен. Поэтому каждая модель оценивается сразу в нескольких конфигурациях
-(CONFIGS) и по нескольким определениям метрики (METRICS); какой вариант совпадает с заявленными
-числами, показывает twotower.report.
+(CONFIGS), по нескольким определениям метрики (METRICS), а на Last.fm ещё и с разными способами
+получить вектор пользователя (full_eval). Какой вариант совпадает с заявленными числами,
+показывает twotower.report.
 
     python -m twotower.evaluate --weights weights/loopback_two_tower_epoch3.pt --out results/lastfm_author.json
 """
@@ -104,6 +105,26 @@ def model_scorer(model, item_group: np.ndarray, device):
     return lambda u: model.user_tower(u) @ item_vecs.T
 
 
+def seed_scorer(model, ds: Interactions, device, by_events: bool):
+    """Как в демо авторов: пользователь — среднее векторов его треков из train, без башни пользователя.
+
+    by_events=False — каждый трек учитывается один раз, True — с весом по числу прослушиваний.
+    """
+    model.eval()
+    item_vecs = model.encode_items(torch.as_tensor(train_only_groups(ds), device=device))
+    if by_events:
+        users, items = ds.train[:, 0], ds.train[:, 1]
+    else:
+        users, items = np.divmod(ds.keys(("train",)), ds.n_items)
+    seed = torch.zeros(ds.n_users, item_vecs.shape[1], device=device)
+    for s in range(0, len(users), 1 << 20):
+        user = torch.as_tensor(users[s : s + (1 << 20)], device=device)
+        item = torch.as_tensor(items[s : s + (1 << 20)], device=device)
+        seed.index_add_(0, user, item_vecs[item])
+    seed = torch.nn.functional.normalize(seed, dim=-1)
+    return lambda u: seed[u] @ item_vecs.T
+
+
 def popularity_scorer(ds: Interactions, device):
     """Бейзлайн: популярность объекта = число разных пользователей с ним в train."""
     counts = np.bincount(ds.keys(("train",)) % ds.n_items, minlength=ds.n_items)
@@ -186,8 +207,10 @@ def full_eval(model, ds: Interactions, device) -> dict:
         "popularity": lambda: popularity_scorer(ds, device),
         "random": lambda: "random",
     }
-    if ds.name == "lastfm":
+    if ds.name == "lastfm":  # варианты для поиска протокола авторов
         scorers["model_artists_train"] = lambda: model_scorer(model, train_only_groups(ds), device)
+        scorers["model_seed_tracks"] = lambda: seed_scorer(model, ds, device, by_events=False)
+        scorers["model_seed_events"] = lambda: seed_scorer(model, ds, device, by_events=True)
     results = {}
     for name, make_scorer in scorers.items():
         scorer = make_scorer()

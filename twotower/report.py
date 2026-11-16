@@ -17,9 +17,16 @@ CLAIM = [0.0708, 0.2172, 0.3140]
 CLAIM_RANDOM = [6.7e-6, 3.3e-5, 6.7e-5]
 CLAIM_USERS, CLAIM_LOSS = 847, 5.6
 
-# (скорер, конфигурация, метрика), если весов авторов нет и протокол подобрать не по чему
-DEFAULT_PROTOCOL = ("model", "test/seen=train+val", "recall")
-SCORER_NOTE = {"model": "исполнитель известен у всех треков", "model_artists_train": "исполнитель только у треков из train"}
+# (скорер, конфигурация, метрика, подмножество пользователей), если весов авторов нет и подбирать протокол не по чему
+DEFAULT_PROTOCOL = ("model", "test/seen=train+val", "recall", "all")
+# как получен вектор пользователя; перебирается при поиске протокола авторов
+SCORER_NOTE = {
+    "model": "башня пользователя",
+    "model_artists_train": "башня пользователя, исполнитель только у треков из train",
+    "model_seed_tracks": "среднее векторов треков пользователя, как в демо авторов",
+    "model_seed_events": "среднее векторов треков с весом по числу прослушиваний",
+}
+SUBSET_NOTE = {"all": "все", "warm": "с историей в train"}
 HEADER = ["", "@10", "@50", "@100", "польз."]
 
 
@@ -57,41 +64,56 @@ def lift(vals: list[float] | None, base: list[float] | None) -> str:
     return f"×{vals[0] / base[0]:.1f}" if vals and base and base[0] > 0 else "—"
 
 
-def find_protocol(author: dict) -> tuple[tuple[str, str, str], list[str]]:
+def find_protocol(author: dict) -> tuple[tuple[str, str, str, str], list[str]]:
     """Перебирает варианты протокола на весах авторов и выбирает ближайший к заявленным числам."""
     ranked = []
-    for scorer in ("model", "model_artists_train"):
+    for scorer in SCORER_NOTE:
         for split, seen in CONFIGS:
             config = config_name(split, seen)
-            for name in METRICS:
-                vals = metric(author, scorer, config, name)
-                if vals:
-                    gap = max(abs(v / c - 1) for v, c in zip(vals, CLAIM))
-                    ranked.append((gap, scorer, config, name, vals))
+            for subset in SUBSET_NOTE:
+                if subset == "warm" and n_users(author, scorer, config, "warm") == n_users(author, scorer, config):
+                    continue  # холодных пользователей нет, вариант совпадает с «все»
+                for name in METRICS:
+                    vals = metric(author, scorer, config, name, subset)
+                    if vals:
+                        gap = max(abs(v / c - 1) for v, c in zip(vals, CLAIM))
+                        ranked.append((gap, scorer, config, name, subset, vals))
     ranked.sort()
     rows = [
-        [f"`{config}`", name, SCORER_NOTE[scorer], str(n_users(author, scorer, config)), *cells(vals), f"{gap:.0%}"]
-        for gap, scorer, config, name, vals in ranked[:8]
+        [
+            f"`{config}`",
+            name,
+            SCORER_NOTE[scorer],
+            f"{SUBSET_NOTE[subset]}: {n_users(author, scorer, config, subset)}",
+            *cells(vals),
+            f"{gap:.0%}",
+        ]
+        for gap, scorer, config, name, subset, vals in ranked[:8]
     ]
     lines = [
         f"Заявлено: Recall@10/50/100 = {' / '.join(f'{c:.4f}' for c in CLAIM)} на {CLAIM_USERS} пользователях. "
         "Код оценки недоступен, поэтому веса авторов оценены во всех вариантах протокола; "
-        "ниже восемь ближайших к заявленным числам (отклонение — худшее из трёх K).",
+        "ниже восемь ближайших к заявленным числам (отклонение — худшее из трёх K). "
+        "Вариантов около двухсот, и близкий может найтись случайно: протокол считаем найденным, "
+        f"только если отклонение — единицы процентов, а пользователей около {CLAIM_USERS}.",
         "",
-        *table(["конфигурация", "метрика", "группы объектов", "польз.", "@10", "@50", "@100", "отклонение"], rows),
+        *table(["конфигурация", "метрика", "вектор пользователя", "пользователи", "@10", "@50", "@100", "отклонение"], rows),
     ]
-    return ranked[0][1:4], lines
+    return ranked[0][1:5], lines
 
 
-def lastfm_section(author: dict | None, retrained: dict | None, scorer: str, config: str, name: str) -> tuple[list[str], list[list[str]]]:
+def lastfm_section(
+    author: dict | None, retrained: dict | None, scorer: str, config: str, name: str, subset: str
+) -> tuple[list[str], list[list[str]]]:
     base = author or retrained
+    random, popular = metric(base, "random", config, name, subset), metric(base, "popularity", config, name, subset)
     rows = [["Заявлено авторами", *cells(CLAIM), str(CLAIM_USERS)]]
     if author:
-        rows.append(row("Веса авторов, наша оценка", author, scorer, config, name))
+        rows.append(row("Веса авторов, наша оценка", author, scorer, config, name, subset))
     if retrained:
-        rows.append(row("Обучение с нуля, наш запуск", retrained, scorer, config, name))
-    rows.append(row("Бейзлайн: популярное", base, "popularity", config, name))
-    rows.append(["Бейзлайн: случайная выдача", *[f"{v:.2e}" for v in metric(base, "random", config, name)], ""])
+        rows.append(row("Обучение с нуля, наш запуск", retrained, scorer, config, name, subset))
+    rows.append(["Бейзлайн: популярное", *cells(popular), ""])
+    rows.append(["Бейзлайн: случайная выдача", *[f"{v:.2e}" for v in random], ""])
     lines = table(HEADER, rows)
     if retrained:
         last = retrained["history"][-1]
@@ -100,11 +122,10 @@ def lastfm_section(author: dict | None, retrained: dict | None, scorer: str, con
             f"эпоха на {retrained['device']} — {last['seconds'] / 60:.1f} мин.",
             "",
         ]
-    random, popular = metric(base, "random", config, name), metric(base, "popularity", config, name)
     summary = [["Last.fm 1K, заявлено авторами", f"{CLAIM[0]:.4f}", f"×{CLAIM[0] / CLAIM_RANDOM[0]:.0f}", "—"]]
     for label, run in (("Last.fm 1K, веса авторов", author), ("Last.fm 1K, обучение с нуля", retrained)):
-        if run:
-            ours = metric(run, scorer, config, name)
+        ours = metric(run, scorer, config, name, subset) if run else None
+        if ours:  # в результатах, посчитанных старой версией кода, такого варианта может не быть
             summary.append([label, f"{ours[0]:.4f}", lift(ours, random), lift(ours, popular)])
     return lines, summary
 
@@ -143,14 +164,14 @@ def movielens_section(runs: dict, split: str, title: str, config: str, name: str
 def build(runs: dict) -> list[str]:
     sections = []  # (заголовок, строки); номера расставляются в конце, потому что части может не быть
     author, retrained = runs.get("lastfm_author"), runs.get("lastfm_retrained")
-    scorer, config, name = DEFAULT_PROTOCOL
+    scorer, config, name, subset = DEFAULT_PROTOCOL
     if author:
-        (scorer, config, name), body = find_protocol(author)
+        (scorer, config, name, subset), body = find_protocol(author)
         sections.append(("Какой протокол оценки у авторов", body))
 
     summary = []
     if author or retrained:
-        body, rows = lastfm_section(author, retrained, scorer, config, name)
+        body, rows = lastfm_section(author, retrained, scorer, config, name, subset)
         sections.append(("Воспроизведение на Last.fm 1K", body))
         summary += rows
     movielens = []
@@ -169,12 +190,10 @@ def build(runs: dict) -> list[str]:
         )
         sections.append(("Сравнение", [*table(["", "@10", "к случайной выдаче", "к популярному"], summary), note, ""]))
 
-    lines = [
-        "# TwoTower (loopback): Last.fm 1K и MovieLens-100k",
-        "",
-        f"Основной протокол: `{config}`, метрика `{name}`; в таблицах значения при K = 10 / 50 / 100.",
-        "",
-    ]
+    protocol = f"Основной протокол: `{config}`, метрика `{name}`; в таблицах значения при K = 10 / 50 / 100."
+    if author or retrained:
+        protocol += f" На Last.fm 1K вектор пользователя — {SCORER_NOTE[scorer]}, пользователи — {SUBSET_NOTE[subset]}."
+    lines = ["# TwoTower (loopback): Last.fm 1K и MovieLens-100k", "", protocol, ""]
     for number, (title, body) in enumerate(sections, 1):
         lines += [f"## {number}. {title}", "", *body]
     return lines
